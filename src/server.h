@@ -7,6 +7,9 @@
 #include <QWebSocket>
 
 class QWebSocket;
+
+namespace shiftnet {
+
 class Client;
 
 class Server : public QObject
@@ -22,20 +25,32 @@ private slots:
     void onWebSocketTextMessageReceived(const QString& message);
 
     void onClientSessionTimeout();
-    void onClientSessionUpdated(int duration);
+    void onClientSessionUpdated();
     void onVoucherSessionTimeout(const QString& code);
 
 private:
     void processClientMessage(QWebSocket* socket, const QString& type, const QVariant& message);
     void processClientMonitorMessage(QWebSocket* socket, const QString& type, const QVariant& message);
 
-    Client* findClient(const QHostAddress& address);
+    void processClientInit(Client* client, const QString& state);
+    void processClientGuestLogin(Client* client, const QString& code);
+    void processClientMemberLogin(Client* client, const QString& username, const QString& password,
+                                  const QString& voucherCode);
+    void processClientSessionStop(Client* client);
+
+    void processClientMaintenanceStart(Client* client);
+    void processClientMaintenanceStop(Client* client);
+
+    void processClientMemberTopup(Client* client, const QString& voucherCode);
+    void processClientGuestTopup(Client* client, const QString& voucherCode);
 
     void sendToClientMonitors(const QString& type, const QVariant& message);
     void sendToClients(const QString& type, const QVariant& message);
-    void sendMessage(QWebSocket* socket, const QString& type, const QVariant& message = QVariant());
+    void sendTo(QWebSocket* socket, const QString& type, const QVariant& message = QVariant());
 
-    bool resetClientSession(Client* client);
+    Client* findClient(const QHostAddress& address);
+
+    void resetDatabaseClientState(Client* client);
 
 private:
     QSettings settings;
@@ -44,7 +59,8 @@ private:
     QList<QWebSocket*> clientMonitorSockets;
     QList<QWebSocket*> clientSockets;
     QHash<int, Client*> clientsByIds;
-    QHash<int, QWebSocket*> clientSocketsByIds;
 };
+
+}
 
 #endif // SERVER_H

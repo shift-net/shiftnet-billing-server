@@ -1,0 +1,666 @@
+#include "server.h"
+#include "client.h"
+#include "database.h"
+
+#include <QWebSocket>
+#include <QJsonDocument>
+#include <QJsonParseError>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QVariantList>
+#include <QVariantMap>
+#include <QVariant>
+#include <QDebug>
+#include <QCryptographicHash>
+#include <QSqlRecord>
+
+using namespace shiftnet;
+
+Server::Server(QObject *parent)
+    : QObject(parent)
+    , settings("shiftnet-billing-server.ini", QSettings::IniFormat)
+    , webSocketServer("snbs", QWebSocketServer::NonSecureMode)
+{
+    Database::setup(settings);
+
+    settings.beginReadArray("Clients");
+    for (const QString key : settings.childKeys()) {
+        int id = key.toInt();
+        Client* client = new Client(this);
+        client->setId(id);
+        client->setHostAddress(settings.value(key).toString());
+        clients.append(client);
+        clientsByIds.insert(id, client);
+
+        connect(client, SIGNAL(sessionTimeout()), SLOT(onClientSessionTimeout()));
+        connect(client, SIGNAL(voucherSessionTimeout(QString)), SLOT(onVoucherSessionTimeout(QString)));
+        connect(client, SIGNAL(sessionUpdated()), SLOT(onClientSessionUpdated()));
+    }
+    settings.endArray();
+
+    connect(&webSocketServer, SIGNAL(newConnection()), SLOT(onWebSocketConnected()));
+}
+
+bool Server::start()
+{
+    if (!Database::init()) {
+        qCritical() << "Database connection failed!";
+        return false;
+    }
+
+    if (!webSocketServer.listen(QHostAddress::Any, settings.value("Server/port").toInt())) {
+        qCritical() << "Websocket server failed!";
+        return false;
+    }
+
+    return true;
+}
+
+Client* Server::findClient(const QHostAddress& address)
+{
+    QString addr = address.toString().split(":").last();
+    for (Client* client: clients)
+        if (client->hostAddress() == addr)
+            return client;
+    return 0;
+}
+
+void Server::onWebSocketConnected()
+{
+    QWebSocket* socket = webSocketServer.nextPendingConnection();
+    connect(socket, SIGNAL(disconnected()), SLOT(onWebSocketDisconnected()));
+    connect(socket, SIGNAL(textMessageReceived(QString)), SLOT(onWebSocketTextMessageReceived(QString)));
+}
+
+void Server::onWebSocketDisconnected()
+{
+    QWebSocket* socket = qobject_cast<QWebSocket*>(sender());
+    if (socket->property("client-type").toString() == "client") {
+        Client* client = clientsByIds.value(socket->property("client-id").toInt());
+
+        User user = client->user();
+
+        if (user.isMember())
+            Database::resetMemberClientState(client->id());
+        else if (user.isGuest())
+            Database::resetVoucherClientState(client->id());
+
+        client->resetConnection();
+
+        sendToClientMonitors("client-disconnected", client->id());
+
+        clientSockets.removeOne(socket);
+        clientSocketsByIds.remove(client->id());
+    }
+    else if (socket->property("client-type").toString() == "client-monitor") {
+        clientMonitorSockets.removeOne(socket);
+    }
+}
+
+void Server::onWebSocketTextMessageReceived(const QString& jsonString)
+{
+    QString closeReason;
+    QJsonParseError jsonParseError;
+    QWebSocket* socket = qobject_cast<QWebSocket*>(sender());
+    const QJsonDocument doc = QJsonDocument::fromJson(jsonString.toUtf8(), &jsonParseError);
+
+    for (;;) {
+        if (!(jsonParseError.error == QJsonParseError::NoError && doc.isArray())) {
+            closeReason = "Invalid json format.";
+            break;
+        }
+
+        QVariantList data = doc.array().toVariantList();
+        if (data.size() != 3) {
+            closeReason = "Invalid json format.";
+            break;
+        }
+
+        const QString clientType = data.at(0).toString();
+
+        bool isClient = false;
+        bool isClientMonitor = false;
+
+        if (socket->property("client-type") == QVariant()) {
+            if (clientType == "client-monitor") {
+                isClientMonitor = true;
+                clientMonitorSockets.append(socket);
+            }
+            else if (clientType == "client") {
+                Client* client = findClient(socket->peerAddress());
+                if (!client) {
+                    closeReason = "Client not registered";
+                    break;
+                }
+                client->setConnection(socket);
+                socket->setProperty("client-id", client->id());
+                clientSockets.append(socket);
+                clientSocketsByIds.insert(client->id(), socket);
+                isClient = true;
+            }
+            else {
+                closeReason = "Unknown client type";
+                break;
+            }
+
+            socket->setProperty("client-type", clientType);
+        }
+
+        if (isClient) {
+            processClientMessage(socket, data.at(1).toString(), data.at(2));
+            return;
+        }
+        else if (isClientMonitor) {
+            processClientMonitorMessage(socket, data.at(1).toString(), data.at(2));
+            return;
+        }
+
+        closeReason = "Unknown client type.";
+        break;
+    }
+
+    qWarning() << "Connection refused:" << qPrintable(closeReason);
+
+    socket->close(QWebSocketProtocol::CloseCodeNormal, closeReason);
+}
+
+void Server::onClientSessionTimeout()
+{
+    Client* client = qobject_cast<Client*>(sender());
+
+    User user = client->user();
+    if (user.isMember())
+        Database::resetMemberClientState(client->id());
+    else if (user.isGuest())
+        Database::resetVoucherClientState(client->id());
+
+    sendTo(client->connection(), "session-timeout", QVariant());
+    sendToClientMonitors("client-session-timeout", client->id());
+}
+
+void Server::onVoucherSessionTimeout(const QString& code)
+{
+    Database::deleteVoucher(code);
+}
+
+void Server::onClientSessionUpdated()
+{
+    Client* client = qobject_cast<Client*>(sender());
+    User user = client->user();
+    if (user.isMember())
+        Database::updateMemberDuration(user.id(), user.duration());
+    else
+        Database::updateVoucherDuration(client->activeVoucher().code(), user.duration());
+
+    sendToClientMonitors("client-session-sync", QVariantMap({
+        {"client"  , client->id()},
+        {"username", user.username()},
+        {"duration", user.duration()},
+    }));
+    sendTo(client->connection(), "session-sync", user.duration());
+}
+
+void Server::processClientInit(Client* client, const QString& state)
+{
+    if (state == "maintenance") {
+        client->startAdminstratorSession();
+    }
+    else {
+        client->resetSession();
+    }
+
+    User user = client->user();
+
+    sendToClientMonitors("client-connected", QVariantMap({
+        { "client", QVariantMap({
+            { "id", client->id() },
+            { "state", client->state() },
+        })},
+        { "user", QVariantMap({
+            { "username", user.username() },
+            { "group", user.group() },
+            { "duration", user.group() },
+        })}
+    }));
+
+    sendTo(client->connection(), "init", QVariantMap({
+        { "company", QVariantMap({
+            { "name", settings.value("Company/name") },
+            { "address", settings.value("Company/address") },
+        })},
+        { "client", QVariantMap({
+            { "id", client->id() },
+            { "password", QCryptographicHash::hash(settings.value("Client/password").toByteArray(), QCryptographicHash::Sha1).toHex() },
+        })}
+    }));
+}
+
+void Server::processClientGuestLogin(Client *client, const QString &code)
+{
+    QSqlRecord voucherRecord = Database::findVoucher(code);
+    if (voucherRecord.isEmpty()) {
+        sendTo(client->connection(), "guest-login-failed", "Voucher tidak ditemukan");
+        return;
+    }
+
+    // cek status kadaluarsa
+    const QDateTime now = QDateTime::currentDateTime();
+    const QDateTime expirationDatetime = voucherRecord.value("expiration_datetime").toDateTime();
+    if (expirationDatetime < now) {
+        sendTo(client->connection(), "guest-login-failed", "Voucher sudah kadaluarsa sejak "
+                    + expirationDatetime.toString("dddd, dd MMMM yyyy hh:mm:ss") + ".");
+        return;
+    }
+
+    // cek sedang dipakai
+    int activeClientId = voucherRecord.value("client_id").toInt();
+    if (activeClientId) {
+        sendTo(client->connection(), "guest-login-failed", "Voucher sedang digunakan di Client " + QString::number(activeClientId) + ".");
+        return;
+    }
+
+    // cek sisa durasi
+    int duration = voucherRecord.value("duration").toInt();
+    if (duration <= 0) {
+        sendTo(client->connection(), "guest-login-failed", "Sisa waktu telah habis.");
+        return;
+    }
+
+    if (!Database::useVoucher(code, client->id())) {
+        sendTo(client->connection(), "guest-login-failed", "Kesalahan pada server database.");
+        return;
+    }
+
+    client->startGuestSession(Voucher(code, duration));
+
+    User user = client->user();
+    sendTo(client->connection(), "session-start", QVariantMap({
+        { "username", user.username() },
+        { "duration", duration },
+    }));
+    sendToClientMonitors("client-session-start", client->toMap());
+}
+
+void Server::processClientMemberLogin(Client* client, const QString& username, const QString& password, const QString& voucherCode)
+{
+    QSqlQuery q(QSqlDatabase::database());
+    q.prepare("select * from members where username=?");
+    q.bindValue(0, username);
+    if (!q.exec()) {
+        qCritical() << "Database error:" << qPrintable(q.lastError().text());
+        return;
+    }
+
+    // pastikan user ada
+    if (!q.next()) {
+        sendTo(socket, "member-login-failed", QVariantList({"username", "Nama pengguna tidak ditemukan."}));
+        return;
+    }
+
+    User user(q.value("username").toString(), q.value("duration").toInt(), q.value("id").toInt());
+
+    // pastikan password cocok
+    if (q.value("password").toString() != password) {
+        sendTo(socket, "member-login-failed", QVariantList({"password", "Kata sandi anda salah."}));
+        return;
+    }
+
+    // pastikan user aktif
+    if (q.value("active").toBool() != true) {
+        sendTo(socket, "member-login-failed", QVariantList({"username", "Akun anda tidak aktif, silahkan hubungi operator."}));
+        return;
+    }
+
+    // jangan sampai double login
+    int activeClientId = q.value("client_id").toInt();
+    if (activeClientId != 0) {
+        sendTo(socket, "member-login-failed", QVariantList({"username", QString("Akun anda sedang login di client %1.").arg(activeClientId)}));
+        return;
+    }
+
+    // Validasi voucher hanya jika user topup
+    if (!voucherCode.isEmpty()) {
+        q.prepare("select * from vouchers where code=?");
+        q.bindValue(0, voucherCode);
+        if (!q.exec()) {
+            qCritical() << "Database error:" << qPrintable(q.lastError().text());
+            return;
+        }
+
+        // pastikan kode voucher ada
+        if (!q.next()) {
+            sendTo(socket, "member-login-failed", QVariantList({"voucherCode", "Kode voucher tidak ditemukan."}));
+            return;
+        }
+
+        // pastikan bukan voucher bekas pakai
+        if (q.value("is_used").toBool()) {
+            sendTo(socket, "member-login-failed", QVariantList({"voucherCode", "Kode voucher bekas tidak dapat dipakai."}));
+            return;
+        }
+
+        // cek status kadaluarsa
+        const QDateTime now = QDateTime::currentDateTime();
+        const QDateTime expirationDatetime = q.value("expiration_datetime").toDateTime();
+        if (expirationDatetime < now) {
+            sendTo(socket, "member-login-failed", QVariantList({
+                        "voucherCode",
+                        "Voucher sudah kadaluarsa sejak " + expirationDatetime.toString("dddd, dd MMMM yyyy hh:mm:ss") + "."
+            }));
+            return;
+        }
+
+        // cek sedang dipakai
+        activeClientId = q.value("client_id").toInt();
+        if (activeClientId) {
+            sendTo(socket, "member-login-failed", QVariantList({
+                "voucherCode",
+                "Voucher sedang digunakan di Client " + QString::number(activeClientId) + "."
+            }));
+            return;
+        }
+
+        // cek sisa durasi
+        int voucherDuration = q.value("duration").toInt();
+        if (voucherDuration <= 0) {
+            sendTo(socket, "member-login-failed", QVariantList({
+                "voucherCode",
+                "Sisa waktu voucher telah habis."
+            }));
+            return;
+        }
+
+        // tambahkan durasi akun user sesuai voucher
+        QSqlDatabase db = QSqlDatabase::database();
+        db.transaction();
+        QSqlQuery qq(db);
+        qq.prepare("update members set duration=? where id=?");
+        qq.bindValue(0, voucherDuration + user.duration());
+        qq.bindValue(1, user.id());
+        if (!qq.exec()) {
+            db.rollback();
+            sendTo(socket, "member-login-failed", QVariantList({"voucherCode", "Topup voucher gagal, kesalahan pada server!"}));
+            return;
+        }
+
+        // hapus voucher dari daftar
+        qq.prepare("delete from vouchers where code=?");
+        qq.bindValue(0, voucherCode);
+        if (!qq.exec()) {
+            db.rollback();
+            sendTo(socket, "member-login-failed", QVariantList({"voucherCode", "Topup voucher gagal, kesalahan pada server!"}));
+            return;
+        }
+
+        if (!db.commit()) {
+            db.rollback();
+            sendTo(socket, "member-login-failed", QVariantList({"voucherCode", "Topup voucher gagal, kesalahan pada server!"}));
+            return;
+        }
+
+        user.addDuration(voucherDuration);
+    }
+
+    // paksa isi voucher  apabila sisa waktu telah habis
+    if (user.duration() <= 0) {
+        sendTo(socket, "member-login-failed", QVariantList({"voucherCode", "Sisa waktu habis, silahkan isi voucher!"}));
+        return;
+    }
+
+    q.prepare("update members set client_id=? where id=?");
+    q.bindValue(0, client->id());
+    q.bindValue(1, user.id());
+    if (!q.exec()) {
+        sendTo(socket, "member-login-failed", QVariantList({"username", "Login gagal, kesalahan pada server!"}));
+        return;
+    }
+
+    client->startMemberSession(user);
+
+    qDebug() << "member login success:" << user.username() << client->id();
+
+    sendTo(socket, "session-start", QVariantMap({
+        { "username", client->user().username() },
+        { "duration", client->user().duration() },
+    }));
+    sendToClientMonitors("client-session-start", QVariantMap({
+        { "client", client->id() },
+        { "username", client->user().username() },
+        { "duration", client->user().duration() },
+    }));
+}
+
+void Server::processClientMaintenanceStart(Client* client)
+{
+    client->startAdminstratorSession();
+    sendToClientMonitors("client-maintenance-started", client->id());
+}
+
+void Server::processClientMaintenanceStop(Client* client)
+{
+    sendToClientMonitors("client-maintenance-finished", client->id());
+    client->resetSession();
+}
+
+void Server::processClientMemberTopup(Client* client, const QString& voucherCode)
+{
+    User user = client->user();
+
+    QSqlRecord voucherRecord = Database::findVoucher(voucherCode);
+    if (voucherRecord.isEmpty()) {
+        sendTo(client->connection(), "user-topup-failed", "Topup voucher gagal, kesalahan pada database server!");
+        return;
+    }
+
+    if (voucherRecord.value("is_used").toBool()) {
+        sendTo(client->connection(), "user-topup-failed", "Kode voucher bekas tidak dapat dipakai.");
+        return;
+    }
+
+    const QDateTime now = QDateTime::currentDateTime();
+    const QDateTime expirationDatetime = voucherRecord.value("expiration_datetime").toDateTime();
+    if (expirationDatetime < now) {
+        sendTo(client->connection(), "user-topup-failed", "Voucher sudah kadaluarsa sejak "
+               + expirationDatetime.toString("dddd, dd MMMM yyyy hh:mm:ss") + ".");
+        return;
+    }
+
+    // cek sedang dipakai
+    int activeClientId = voucherRecord.value("client_id").toInt();
+    if (activeClientId) {
+        sendTo(client->connection(), "user-topup-failed", "Voucher sedang digunakan di Client "
+               + QString::number(activeClientId) + ".");
+        return;
+    }
+
+    // cek sisa durasi
+    int voucherDuration = voucherRecord.value("duration").toInt();
+    if (voucherDuration <= 0) {
+        sendTo(client->connection(), "user-topup-failed", "Sisa waktu voucher telah habis.");
+        return;
+    }
+
+    Voucher voucher(voucherCode, voucherDuration);
+
+    if (!Database::topupMemberVoucher(user.id(), user.duration(), voucher.code(), voucher.duration())) {
+        sendTo(client->connection(), "user-topup-failed", "Kesalahan pada server database.");
+        return;
+    }
+
+    client->topupVoucher(voucher);
+
+    sendTo(client->connection(), "user-topup-success", voucherDuration);
+    sendToClientMonitors("user-topup-success", client->toMap());
+}
+
+void Server::processClientGuestTopup(Client* client, const QString& code)
+{
+    q.prepare("select * from vouchers where code=?");
+    q.bindValue(0, voucherCode);
+    if (!q.exec()) {
+        qCritical() << "Database error:" << qPrintable(q.lastError().text());
+        sendTo(socket, "user-topup-failed", "Topup voucher gagal, kesalahan pada database server!");
+        return;
+    }
+
+    // pastikan kode voucher ada
+    if (!q.next()) {
+        sendTo(socket, "user-topup-failed", "Kode voucher tidak ditemukan.");
+        return;
+    }
+
+    // cek status kadaluarsa
+    const QDateTime now = QDateTime::currentDateTime();
+    const QDateTime expirationDatetime = q.value("expiration_datetime").toDateTime();
+    if (expirationDatetime < now) {
+        sendTo(socket, "user-topup-failed", "Voucher sudah kadaluarsa sejak "
+                    + expirationDatetime.toString("dddd, dd MMMM yyyy hh:mm:ss") + ".");
+        return;
+    }
+
+    // cek sedang dipakai
+    int activeClientId = q.value("client_id").toInt();
+    if (activeClientId) {
+        sendTo(socket, "user-topup-failed", "Voucher sedang digunakan di Client " + QString::number(activeClientId) + ".");
+        return;
+    }
+
+    // cek sisa durasi
+    int voucherDuration = q.value("duration").toInt();
+    if (voucherDuration <= 0) {
+        sendTo(socket, "user-topup-failed", "Sisa waktu sudah habis.");
+        return;
+    }
+
+    // update session di database
+    q.prepare("update vouchers set client_id=?, is_used=1 where code=?");
+    q.bindValue(0, client->id());
+    q.bindValue(1, voucherCode);
+    if (!q.exec()) {
+        qCritical() << "Database error:" << qPrintable(q.lastError().text());
+        return;
+    }
+
+    // topup voucher
+    client->topupVoucher(Voucher(voucherCode, voucherDuration));
+
+    qDebug() << "voucher topup success:" << voucherCode << client->id();
+
+    sendTo(socket, "user-topup-success", voucherDuration);
+
+    sendToClientMonitors("user-topup", QVariantMap({
+        { "client", client->id() },
+        { "username", user.username() },
+        { "duration", voucherDuration },
+    }));
+}
+
+void Server::processClientMessage(QWebSocket* socket, const QString& type, const QVariant& message)
+{
+    Client* client = clientsByIds.value(socket->property("client-id").toInt());
+    if (type == "init") {
+        processClientInit(client, message.toString());
+    }
+    else if (type == "guest-login") {
+        processClientGuestLogin(client, message.toString());
+    }
+    else if (type == "member-login") {
+        const QStringList messages = message.toStringList();
+        processClientMemberLogin(client, messages.at(0), messages.at(1), messages.at(2));
+    }
+    else if (type == "session-stop") {
+        if (!resetClientSession(client)) {
+            return;
+        }
+        client->resetSession();
+        sendTo(socket, "session-stop");
+        sendToClientMonitors("client-session-stop", QVariantMap({
+            { "client", client->id() },
+            { "username", client->user().username() },
+        }));
+    }
+    else if (type == "user-topup") {
+        const QString code = message.toString();
+        if (client->user().isMember())
+            processClientMemberTopup(client, code);
+        else
+            processClientGuestTopup(client, code);
+    }
+    else if (type == "maintenance-start") {
+        processClientMaintenanceStart(client);
+    }
+    else if (type == "maintenance-stop") {
+        processClientMaintenanceStop(client);
+    }
+}
+
+void Server::processClientMonitorMessage(QWebSocket* connection, const QString& msgType, const QVariant& message)
+{
+    if (msgType == "init") {
+        QVariantList clientList;
+        for (Client* client: clients) {
+            User user = client->user();
+            clientList.append(QVariantMap({
+                { "client", QVariantMap({
+                    { "id", client->id() },
+                    { "state", client->state() },
+                })},
+                { "user", QVariantMap({
+                    { "username", user.username() },
+                    { "group", user.group() },
+                    { "duration", user.duration() },
+                })}
+            }));
+        }
+
+        sendTo(connection, "init", QVariantMap({
+            { "company", QVariantMap({
+                { "name", settings.value("Company/name") },
+                { "address", settings.value("Company/address") },
+            })},
+            { "clients", clientList }
+        }));
+    }
+    else if (msgType == "stop-sessions") {
+        for (const QVariant id: message.toList()) {
+            Client* client = clientsByIds.value(id);
+            if (!client) continue;
+            if (!client->connection()) continue;
+            processClientMessage(client->connection(), "session-stop", QVariant());
+        }
+    }
+    else if (msgType == "shutdown-clients" || msgType == "restart-clients") {
+        for (const QVariant id: message.toList()) {
+            QWebSocket* socket = clientSocketsByIds.value(id.toInt());
+            if (socket) {
+
+            }
+        }
+        for (const QVariant id: message.toList()) {
+            Client* client = clientsByIds.value(id);
+            if (!client) continue;
+            if (!client->connection()) continue;
+            sendTo(client->connection(), "system-" + msgType.split("-").first());
+        }
+    }
+}
+
+void Server::sendToClientMonitors(const QString& type, const QVariant& data)
+{
+    for (QWebSocket* socket: clientMonitorSockets)
+        sendTo(socket, type, data);
+}
+
+void Server::sendToClients(const QString& type, const QVariant& data)
+{
+    for (QWebSocket* socket: clientSockets)
+        sendTo(socket, type, data);
+}
+
+void Server::sendTo(QWebSocket* socket, const QString& type, const QVariant& message)
+{
+    QString textMessage = QJsonDocument::fromVariant(QVariantList({ type, message })).toJson(QJsonDocument::Compact);
+    qDebug() << "sending message" << qPrintable(textMessage);
+    socket->sendTextMessage(textMessage);
+    socket->flush();
+}

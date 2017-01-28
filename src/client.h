@@ -4,72 +4,71 @@
 #include <QTimer>
 #include <QQueue>
 
-class Socket;
+#include "user.h"
+#include "voucher.h"
 
-class User
-{
-public:
-    User(const QString& username = QString(), int duration = 0, int id = 0)
-        : _id(id), _duration(duration), _username(username) {}
+class QWebSocket;
 
-    inline int id() const { return _id; }
-    inline QString username() const { return _username; }
-    inline bool isMember() const { return _id != 0; }
-    inline int duration() const { return _duration; }
-
-    inline void addDuration(int minute) { _duration += minute; }
-
-private:
-    int _id;
-    int _duration;
-    QString _username;
-};
-
-struct Voucher
-{
-    int duration;
-    QString code;
-    Voucher(const QString& code = QString(), int duration = 0)
-        : duration(duration), code(code) {}
-};
+namespace shiftnet {
 
 class Client : public QObject
 {
     Q_OBJECT
 
 public:
+    enum State {
+        Offline,
+        Ready,
+        Used,
+        Maintenance
+    };
+
     explicit Client(QObject* parent = 0);
 
-    inline void setHostAddress(const QString& address) { _hostAddress = address; }
-    inline QString hostAddress() const { return _hostAddress; }
+    inline void setConnection(QWebSocket* socket) { _socket = socket; }
+    inline QWebSocket* connection() const { return _socket; }
 
     inline void setId(int id) { _id = id; }
     inline int id() const { return _id; }
 
+    inline void setHostAddress(const QString& address) { _hostAddress = address; }
+    inline QString hostAddress() const { return _hostAddress; }
+
+    inline State state() const { return _state; }
     inline User user() const { return _user; }
+    inline Voucher activeVoucher() const { return _activeVoucher; }
 
     void topupVoucher(const Voucher& voucher);
     void startGuestSession(const Voucher& voucher);
     void startMemberSession(const User& user);
-    void stopSession();
+    void startAdminstratorSession();
+    void resetSession();
+    void resetConnection();
 
-    inline Voucher activeVoucher() const { return _activeVoucher; }
+    QVariantMap toMap() const;
 
 signals:
     void voucherSessionTimeout(const QString& code);
     void sessionTimeout();
-    void sessionUpdated(int remainingDuration);
+    void sessionUpdated();
 
 private slots:
     void updateDuration();
 
 private:
     QTimer _timer;
+    QWebSocket* _socket;
+
     int _id;
+    State _state;
     QString _hostAddress;
+    QString _macAddress;
+
     User _user;
     Voucher _activeVoucher;
     QQueue<Voucher> _vouchers;
 };
+
+}
 
 #endif // CLIENT_H
