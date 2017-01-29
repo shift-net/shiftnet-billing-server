@@ -7,7 +7,8 @@ SOURCES += \
     client.cpp \
     server.cpp \
     database.cpp \
-    vouchervalidator.cpp
+    vouchervalidator.cpp \
+    voucher.cpp
 
 HEADERS  += \
     global.h \
