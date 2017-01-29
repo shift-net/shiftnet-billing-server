@@ -51,6 +51,9 @@ void Client::resetSession()
 void Client::updateDuration()
 {
     _user.addDuration(-1);
+    if (_user.isGuest())
+         _activeVoucher.decreaseDuration(1);
+
     emit sessionUpdated();
 
     if (_user.duration() == 0)
@@ -61,7 +64,6 @@ void Client::updateDuration()
         return;
     }
 
-    _activeVoucher.decreaseDuration(1);
     if (_activeVoucher.duration() > 0)
         return;
 
