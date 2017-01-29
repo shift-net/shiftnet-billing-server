@@ -12,8 +12,9 @@ public:
         : _duration(duration), _code(code) {}
 
     inline QString code() const { return _code; }
-
     inline int duration() const { return _duration; }
+    QString durationString() const;
+
     inline void decreaseDuration(int minute) { _duration -= minute; }
 
 private:
