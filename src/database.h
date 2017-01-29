@@ -7,11 +7,16 @@ class QSqlRecord;
 
 namespace shiftnet {
 
+class User;
+class Voucher;
+
 class Database
 {
 public:
     static void setup(QSettings& settings);
     static bool init();
+
+    static bool topupVoucher(int clientId, const User& user, const Voucher& voucher);
 
     static bool useVoucher(const QString& code, int clientId);
     static bool deleteVoucher(const QString& code);
@@ -26,6 +31,8 @@ public:
 
     static QSqlRecord findVoucher(const QString& code);
     static QSqlRecord findMember(const QString& username);
+
+    static bool logUserActivity(int clientId, const User& user, const QString& activity, const QString &text);
 
 private:
     Database();

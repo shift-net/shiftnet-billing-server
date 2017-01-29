@@ -41,8 +41,7 @@ private:
     void processClientMaintenanceStart(Client* client);
     void processClientMaintenanceStop(Client* client);
 
-    void processClientMemberTopup(Client* client, const QString& voucherCode);
-    void processClientGuestTopup(Client* client, const QString& voucherCode);
+    void processClientUserTopup(Client* client, const QString& voucherCode);
 
     void sendToClientMonitors(const QString& type, const QVariant& message);
     void sendToClients(const QString& type, const QVariant& message);

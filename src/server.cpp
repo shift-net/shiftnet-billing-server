@@ -15,6 +15,12 @@
 #include <QCryptographicHash>
 #include <QSqlRecord>
 
+#define ACTIVITY_USER_TOPUP "topup"
+#define ACTIVITY_USER_SESSION_START "session-start"
+#define ACTIVITY_USER_SESSION_STOP  "session-stop"
+#define ACTIVITY_MAINTENANCE_START  "maintenance-start"
+#define ACTIVITY_MAINTENANCE_STOP   "maintenance-stop"
+
 using namespace shiftnet;
 
 Server::Server(QObject *parent)
@@ -70,6 +76,11 @@ void Server::onWebSocketDisconnected()
     QWebSocket* socket = qobject_cast<QWebSocket*>(sender());
     if (socket->property("client-type").toString() == "client") {
         Client* client = clientsByIds.value(socket->property("client-id").toInt());
+        const User user = client->user();
+        if (user.isMember() || user.isGuest()) {
+            Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_STOP,
+                                      QString("Koneksi terputus, sesi telah dihentikan."));
+        }
         resetDatabaseClientState(client);
         client->resetConnection();
         sendToClientMonitors("client-disconnected", client->toMap());
@@ -146,6 +157,11 @@ void Server::onWebSocketTextMessageReceived(const QString& jsonString)
 void Server::onClientSessionTimeout()
 {
     Client* client = qobject_cast<Client*>(sender());
+    const User user = client->user();
+    if (user.isMember()) {
+        Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_STOP,
+                                  QString("Pemakaian dihentikan karena sisa waktu telah habis."));
+    }
     resetDatabaseClientState(client);
     sendTo(client->connection(), "session-timeout", QVariant());
     sendToClientMonitors("client-session-timeout", client->toMap());
@@ -153,6 +169,9 @@ void Server::onClientSessionTimeout()
 
 void Server::onVoucherSessionTimeout(const QString& voucherCode)
 {
+    Client* client = qobject_cast<Client*>(sender());
+    Database::logUserActivity(client->id(), client->user(),
+                              ACTIVITY_USER_SESSION_STOP, QString("Pemakaian dihentikan. Durasi voucher %1 telah habis.").arg(voucherCode));
     Database::deleteVoucher(voucherCode);
 }
 
@@ -212,6 +231,8 @@ void Server::processClientGuestLogin(Client *client, const QString &voucherCode)
     }
 
     client->startGuestSession(voucher);
+    Database::logUserActivity(client->id(), client->user(), ACTIVITY_USER_SESSION_START,
+                              QString("Memulai pemakaian voucher %1 durasi %2.").arg(voucher.code(), voucher.durationString()));
 
     User user = client->user();
     sendTo(client->connection(), "session-start", QVariantMap({
@@ -266,6 +287,8 @@ void Server::processClientMemberLogin(Client* client, const QString& username, c
         }
 
         user.addDuration(voucher.duration());
+        Database::logUserActivity(client->id(), user, ACTIVITY_USER_TOPUP,
+                                  QString("Topup voucher %1 durasi %2.").arg(voucher.code(), voucher.durationString()));
     }
 
     if (user.duration() <= 0) {
@@ -279,6 +302,7 @@ void Server::processClientMemberLogin(Client* client, const QString& username, c
     }
 
     client->startMemberSession(user);
+    Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_START, "Memulai pemakaian.");
 
     sendTo(client->connection(), "session-start", QVariantMap({
         { "username", user.username() },
@@ -290,62 +314,56 @@ void Server::processClientMemberLogin(Client* client, const QString& username, c
 void Server::processClientMaintenanceStart(Client* client)
 {
     client->startAdminstratorSession();
+    Database::logUserActivity(client->id(), client->user(), ACTIVITY_MAINTENANCE_START, "Pemeliharaan dimulai.");
     sendToClientMonitors("client-maintenance-started", client->toMap());
 }
 
 void Server::processClientMaintenanceStop(Client* client)
 {
+    Database::logUserActivity(client->id(), client->user(), ACTIVITY_MAINTENANCE_STOP, "Pemeliharaan selesai.");
     client->resetSession();
     sendToClientMonitors("client-maintenance-finished", client->toMap());
 }
 
-void Server::processClientMemberTopup(Client* client, const QString& voucherCode)
+void Server::processClientUserTopup(Client* client, const QString& voucherCode)
 {
     VoucherValidator validator;
+    User user = client->user();
 
-    if (!validator.isValid(voucherCode, true)) {
+    if (!validator.isValid(voucherCode, user.isMember())) {
         sendTo(client->connection(), "user-topup-failed", validator.error());
         return;
     }
 
     const Voucher voucher = validator.voucher();
-    const User user = client->user();
 
-    if (!Database::topupMemberVoucher(user.id(), user.duration(), voucher.code(), voucher.duration())) {
+    if (!Database::topupVoucher(client->id(), user, voucher)) {
         sendTo(client->connection(), "user-topup-failed", "Kesalahan pada server database.");
         return;
     }
 
     client->topupVoucher(voucher);
 
+    Database::logUserActivity(client->id(), user, ACTIVITY_USER_TOPUP,
+                              QString("Topup voucher %1 durasi %2").arg(voucher.code(), voucher.durationString()));
+
     sendTo(client->connection(), "user-topup-success", voucher.duration());
     sendToClientMonitors("user-topup-success", client->toMap());
 }
 
-void Server::processClientGuestTopup(Client* client, const QString& voucherCode)
-{
-    VoucherValidator validator;
-
-    if (!validator.isValid(voucherCode, false)) {
-        sendTo(client->connection(), "user-topup-failed", validator.error());
-        return;
-    }
-
-    const Voucher voucher = validator.voucher();
-
-    if (!Database::useVoucher(voucher.code(), client->id())) {
-        sendTo(client->connection(), "user-topup-failed", "Kesalahan pada database server.");
-        return;
-    }
-
-    client->topupVoucher(voucher);
-
-    sendTo(client->connection(), "user-topup-success", voucher.duration());
-    sendToClientMonitors("user-topup", client->toMap());
-}
-
 void Server::processClientSessionStop(Client* client)
 {
+    const User user = client->user();
+    QString activityInfo;
+    if (user.isGuest()) {
+        const Voucher voucher = client->activeVoucher();
+        activityInfo = QString("Kode voucher: %1, Sisa Waktu: %2.").arg(voucher.code(), voucher.durationString());
+    }
+    else if (user.isMember()) {
+        activityInfo = QString("Sisa Waktu: %1.").arg(user.duration());
+    }
+    Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_STOP, "Sesi pemakaian dihentikan. " + activityInfo);
+
     resetDatabaseClientState(client);
     client->resetSession();
     sendTo(client->connection(), "session-stop");
@@ -369,11 +387,7 @@ void Server::processClientMessage(QWebSocket* socket, const QString& type, const
         processClientSessionStop(client);
     }
     else if (type == "user-topup") {
-        const QString code = message.toString();
-        if (client->user().isMember())
-            processClientMemberTopup(client, code);
-        else
-            processClientGuestTopup(client, code);
+        processClientUserTopup(client, message.toString());
     }
     else if (type == "maintenance-start") {
         processClientMaintenanceStart(client);

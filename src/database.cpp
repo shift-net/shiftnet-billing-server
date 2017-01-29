@@ -1,4 +1,6 @@
 #include "database.h"
+#include "user.h"
+#include "voucher.h"
 
 #include <QSqlDatabase>
 #include <QSqlRecord>
@@ -212,6 +214,38 @@ bool Database::setMemberClientId(int memberId, int clientId)
     q.prepare("update members set client_id=? where id=?");
     q.bindValue(0, clientId);
     q.bindValue(1, memberId);
+    if (!q.exec()) {
+        LOG_DB_ERROR(q);
+        return false;
+    }
+    return true;
+}
+
+bool Database::topupVoucher(int clientId, const User& user, const Voucher& voucher)
+{
+    if (user.isMember())
+        return topupMemberVoucher(user.id(), user.duration(), voucher.code(), voucher.duration());
+
+    if (user.isGuest())
+        return useVoucher(voucher.code(), clientId);
+
+    return false;
+}
+
+bool Database::logUserActivity(int clientId, const User& user, const QString& activity, const QString &text)
+{
+    QSqlQuery q(QSqlDatabase::database());
+    q.prepare("insert into user_activities"
+              "( date_time, client_id, user_id, user_group, user_username, activity_type, activity_detail)"
+              "values"
+              "(:date_time,:client_id,:user_id,:user_group,:user_username,:activity_type,:activity_detail)");
+    q.bindValue(":date_time", QDateTime::currentDateTime());
+    q.bindValue(":client_id", clientId);
+    q.bindValue(":user_id", user.id());
+    q.bindValue(":user_group", user.group());
+    q.bindValue(":user_username", user.username());
+    q.bindValue(":activity_type", activity);
+    q.bindValue(":activity_detail", text);
     if (!q.exec()) {
         LOG_DB_ERROR(q);
         return false;
