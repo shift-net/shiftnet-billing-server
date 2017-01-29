@@ -10,6 +10,7 @@ class QWebSocket;
 
 namespace shiftnet {
 
+class User;
 class Client;
 
 class Server : public QObject
@@ -24,7 +25,7 @@ private slots:
     void onWebSocketDisconnected();
     void onWebSocketTextMessageReceived(const QString& message);
 
-    void onClientSessionTimeout();
+    void onClientSessionTimeout(const User& user);
     void onClientSessionUpdated();
     void onVoucherSessionTimeout(const QString& code);
 
@@ -48,8 +49,6 @@ private:
     void sendTo(QWebSocket* socket, const QString& type, const QVariant& message = QVariant());
 
     Client* findClient(const QHostAddress& address);
-
-    void resetDatabaseClientState(Client* client);
 
 private:
     QSettings settings;

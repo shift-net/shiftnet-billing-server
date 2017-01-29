@@ -125,11 +125,11 @@ bool Database::resetVoucherClientState(int id)
     return q.numRowsAffected();
 }
 
-bool Database::resetMemberClientState(int id)
+bool Database::resetMemberClientState(int memberId)
 {
     QSqlQuery q(QSqlDatabase::database());
-    q.prepare("update members set client_id=0 where client_id=?");
-    q.bindValue(0, id);
+    q.prepare("update members set client_id=0 where id=?");
+    q.bindValue(0, memberId);
     if (!q.exec()) {
         LOG_DB_ERROR(q);
         return false;
@@ -149,7 +149,6 @@ QSqlRecord Database::findVoucher(const QString &code)
     }
 
     if (!q.next()) {
-        LOG_DB_ERROR(q);
         return QSqlRecord();
     }
 
@@ -248,6 +247,27 @@ bool Database::logUserActivity(int clientId, const User& user, const QString& ac
     q.bindValue(":activity_detail", text);
     if (!q.exec()) {
         LOG_DB_ERROR(q);
+        return false;
+    }
+    return true;
+}
+
+bool Database::transaction()
+{
+    QSqlDatabase db = QSqlDatabase::database();
+    if (!db.transaction()) {
+        LOG_DB_ERROR(db);
+        return false;
+    }
+    return true;
+}
+
+bool Database::commit()
+{
+    QSqlDatabase db = QSqlDatabase::database();
+    if (!db.commit()) {
+        LOG_DB_ERROR(db);
+        db.rollback();
         return false;
     }
     return true;

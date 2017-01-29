@@ -11,6 +11,7 @@ Client::Client(QObject *parent)
 {
     _timer.setInterval(60 * 1000);
     _timer.setTimerType(Qt::PreciseTimer);
+    _timer.setSingleShot(false);
     connect(&_timer, SIGNAL(timeout()), SLOT(updateDuration()));
 }
 
@@ -51,29 +52,25 @@ void Client::resetSession()
 void Client::updateDuration()
 {
     _user.addDuration(-1);
-    if (_user.isGuest())
-         _activeVoucher.decreaseDuration(1);
+
+    if (_user.isGuest()) {
+        _activeVoucher.decreaseDuration(1);
+
+        if (_activeVoucher.duration() <= 0) {
+            emit voucherSessionTimeout(_activeVoucher.code());
+
+            if (!_vouchers.isEmpty())
+                _activeVoucher = _vouchers.dequeue();
+        }
+    }
 
     emit sessionUpdated();
 
-    if (_user.duration() == 0)
-        emit sessionTimeout();
-
-    if (_user.isMember()) {
+    if (_user.duration() == 0) {
+        User user = _user;
         resetSession();
-        return;
+        emit sessionTimeout(user);
     }
-
-    if (_activeVoucher.duration() > 0)
-        return;
-
-    emit voucherSessionTimeout(_activeVoucher.code());
-    if (_vouchers.isEmpty()) {
-        resetSession();
-        return;
-    }
-
-    _activeVoucher = _vouchers.dequeue();
 }
 
 void Client::startAdminstratorSession()

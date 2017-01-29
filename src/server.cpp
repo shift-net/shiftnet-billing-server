@@ -11,7 +11,6 @@
 #include <QVariantList>
 #include <QVariantMap>
 #include <QVariant>
-#include <QDebug>
 #include <QCryptographicHash>
 #include <QSqlRecord>
 
@@ -39,7 +38,7 @@ Server::Server(QObject *parent)
         clients.append(client);
         clientsByIds.insert(id, client);
 
-        connect(client, SIGNAL(sessionTimeout()), SLOT(onClientSessionTimeout()));
+        connect(client, SIGNAL(sessionTimeout(User)), SLOT(onClientSessionTimeout(User)));
         connect(client, SIGNAL(voucherSessionTimeout(QString)), SLOT(onVoucherSessionTimeout(QString)));
         connect(client, SIGNAL(sessionUpdated()), SLOT(onClientSessionUpdated()));
     }
@@ -77,11 +76,19 @@ void Server::onWebSocketDisconnected()
     if (socket->property("client-type").toString() == "client") {
         Client* client = clientsByIds.value(socket->property("client-id").toInt());
         const User user = client->user();
+
+        Database::transaction();
         if (user.isMember() || user.isGuest()) {
+            if (user.isMember())
+                Database::resetMemberClientState(user.id());
+            else
+                Database::resetVoucherClientState(client->id());
+
             Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_STOP,
                                       QString("Koneksi terputus, sesi telah dihentikan."));
         }
-        resetDatabaseClientState(client);
+        Database::commit();
+
         client->resetConnection();
         sendToClientMonitors("client-disconnected", client->toMap());
         clientSockets.removeOne(socket);
@@ -153,16 +160,26 @@ void Server::onWebSocketTextMessageReceived(const QString& jsonString)
 }
 
 // Client Callbacks
-
-void Server::onClientSessionTimeout()
+#include <QDebug>
+void Server::onClientSessionTimeout(const User& user)
 {
     Client* client = qobject_cast<Client*>(sender());
-    const User user = client->user();
-    if (user.isMember()) {
+
+    Database::transaction();
+    if (user.isMember() || user.isGuest()) {
+        if (user.isMember()) {
+            qDebug() << user.id();
+            qDebug() << Database::resetMemberClientState(user.id());
+            Database::updateMemberDuration(user.id(), 0);
+        }
+        else {
+            Database::resetVoucherClientState(client->id());
+        }
         Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_STOP,
                                   QString("Pemakaian dihentikan karena sisa waktu telah habis."));
     }
-    resetDatabaseClientState(client);
+    Database::commit();
+
     sendTo(client->connection(), "session-timeout", QVariant());
     sendToClientMonitors("client-session-timeout", client->toMap());
 }
@@ -292,7 +309,7 @@ void Server::processClientMemberLogin(Client* client, const QString& username, c
     }
 
     if (user.duration() <= 0) {
-        sendTo(client->connection(), "member-login-failed", QVariantList({"voucherCode", "Sisa waktu habis, silahkan isi voucher!"}));
+        sendTo(client->connection(), "member-login-failed", QVariantList({"username", "Sisa waktu habis, silahkan isi voucher!"}));
         return;
     }
 
@@ -348,23 +365,26 @@ void Server::processClientUserTopup(Client* client, const QString& voucherCode)
                               QString("Topup voucher %1 durasi %2").arg(voucher.code(), voucher.durationString()));
 
     sendTo(client->connection(), "user-topup-success", voucher.duration());
-    sendToClientMonitors("user-topup-success", client->toMap());
 }
 
 void Server::processClientSessionStop(Client* client)
 {
     const User user = client->user();
     QString activityInfo;
+
+    Database::transaction();
     if (user.isGuest()) {
+        Database::resetVoucherClientState(client->id());
         const Voucher voucher = client->activeVoucher();
         activityInfo = QString("Kode voucher: %1, Sisa Waktu: %2.").arg(voucher.code(), voucher.durationString());
     }
     else if (user.isMember()) {
+        Database::resetMemberClientState(user.id());
         activityInfo = QString("Sisa Waktu: %1.").arg(user.duration());
     }
     Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_STOP, "Sesi pemakaian dihentikan. " + activityInfo);
+    Database::commit();
 
-    resetDatabaseClientState(client);
     client->resetSession();
     sendTo(client->connection(), "session-stop");
     sendToClientMonitors("client-session-stop", client->toMap());
@@ -460,15 +480,6 @@ void Server::sendTo(QWebSocket* socket, const QString& type, const QVariant& mes
 }
 
 // Common helper methods
-void Server::resetDatabaseClientState(Client* client)
-{
-    User user = client->user();
-    if (user.isMember())
-        Database::resetMemberClientState(user.id());
-    else
-        Database::resetVoucherClientState(client->id());
-}
-
 Client* Server::findClient(const QHostAddress& address)
 {
     QString addr = address.toString().split(":").last();

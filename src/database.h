@@ -16,6 +16,9 @@ public:
     static void setup(QSettings& settings);
     static bool init();
 
+    static bool transaction();
+    static bool commit();
+
     static bool topupVoucher(int clientId, const User& user, const Voucher& voucher);
 
     static bool useVoucher(const QString& code, int clientId);

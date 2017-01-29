@@ -49,7 +49,7 @@ public:
 
 signals:
     void voucherSessionTimeout(const QString& code);
-    void sessionTimeout();
+    void sessionTimeout(const User& user);
     void sessionUpdated();
 
 private slots:
