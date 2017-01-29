@@ -214,7 +214,7 @@ void Server::processClientInit(Client* client, const QString& state)
     sendToClientMonitors("client-connected", client->toMap());
 }
 
-void Server::processClientGuestLogin(Client *client, const QString &voucherCode)
+void Server::processClientGuestLogin(Client *client, const QString& username, const QString &voucherCode)
 {
     VoucherValidator validator;
 
@@ -230,7 +230,7 @@ void Server::processClientGuestLogin(Client *client, const QString &voucherCode)
         return;
     }
 
-    client->startGuestSession(voucher);
+    client->startGuestSession(username, voucher);
     Database::logUserActivity(client->id(), client->user(), ACTIVITY_USER_SESSION_START,
                               QString("Memulai pemakaian voucher %1 durasi %2.").arg(voucher.code(), voucher.durationString()));
 
@@ -377,7 +377,8 @@ void Server::processClientMessage(QWebSocket* socket, const QString& type, const
         processClientInit(client, message.toString());
     }
     else if (type == "guest-login") {
-        processClientGuestLogin(client, message.toString());
+        const QStringList messages = message.toStringList();
+        processClientGuestLogin(client, messages.at(0), messages.at(1));
     }
     else if (type == "member-login") {
         const QStringList messages = message.toStringList();
@@ -404,18 +405,7 @@ void Server::processClientMonitorMessage(QWebSocket* connection, const QString& 
     if (msgType == "init") {
         QVariantList clientList;
         for (Client* client: clients) {
-            User user = client->user();
-            clientList.append(QVariantMap({
-                { "client", QVariantMap({
-                    { "id", client->id() },
-                    { "state", client->state() },
-                })},
-                { "user", QVariantMap({
-                    { "username", user.username() },
-                    { "group", user.group() },
-                    { "duration", user.duration() },
-                })}
-            }));
+            clientList.append(client->toMap());
         }
 
         sendTo(connection, "init", QVariantMap({
@@ -430,13 +420,20 @@ void Server::processClientMonitorMessage(QWebSocket* connection, const QString& 
         for (const QVariant id: message.toList()) {
             Client* client = clientsByIds.value(id.toInt());
             if (!(client && client->connection())) continue;
-            processClientSessionStop(client);
+
+            if (client->state() == Client::Used)
+                processClientSessionStop(client);
+            else if (client->state() == Client::Maintenance) {
+                sendTo(client->connection(), "maintenance-remote-stop");
+                processClientMaintenanceStop(client);
+            }
         }
     }
     else if (msgType == "shutdown-clients" || msgType == "restart-clients") {
         for (const QVariant id: message.toList()) {
             Client* client = clientsByIds.value(id.toInt());
             if (!(client && client->connection())) continue;
+            if (client->state() == Client::Offline) continue;
             sendTo(client->connection(), "system-" + msgType.split("-").first());
         }
     }

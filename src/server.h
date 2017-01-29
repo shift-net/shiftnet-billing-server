@@ -33,7 +33,7 @@ private:
     void processClientMonitorMessage(QWebSocket* socket, const QString& type, const QVariant& message);
 
     void processClientInit(Client* client, const QString& state);
-    void processClientGuestLogin(Client* client, const QString& code);
+    void processClientGuestLogin(Client* client, const QString& username, const QString& code);
     void processClientMemberLogin(Client* client, const QString& username, const QString& password,
                                   const QString& voucherCode);
     void processClientSessionStop(Client* client);

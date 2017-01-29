@@ -21,8 +21,8 @@ public:
         , _group(Unknown)
     {}
 
-    inline static User createGuest(int duration)
-    { return User(0, "Tamu", duration, Guest); }
+    inline static User createGuest(const QString& username, int duration)
+    { return User(0, username, duration, Guest); }
 
     inline static User createAdministrator()
     { return User(0, "Administrator", 0, Administrator); }

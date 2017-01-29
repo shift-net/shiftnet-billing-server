@@ -22,11 +22,11 @@ void Client::topupVoucher(const Voucher& voucher)
     emit sessionUpdated();
 }
 
-void Client::startGuestSession(const Voucher& voucher)
+void Client::startGuestSession(const QString& username, const Voucher& voucher)
 {
     resetSession();
     _state = Used;
-    _user = User::createGuest(voucher.duration());
+    _user = User::createGuest(username, voucher.duration());
     _activeVoucher = voucher;
     _timer.start();
 }
@@ -93,13 +93,12 @@ void Client::resetConnection()
 QVariantMap Client::toMap() const
 {
     return QVariantMap({
-        { "client", QVariantMap({
-            { "id",    id()},
-            { "state", state()},
-        })},
-        { "user", QVariantMap({
+        { "id"   , id()},
+        { "state", state()},
+        { "user" , QVariantMap({
+            { "id"      , _user.id() },
             { "username", _user.username() },
-            { "group", _user.group() },
+            { "group"   , _user.group() },
             { "duration", _user.duration() },
         })},
     });

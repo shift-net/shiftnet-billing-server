@@ -39,7 +39,7 @@ public:
     inline Voucher activeVoucher() const { return _activeVoucher; }
 
     void topupVoucher(const Voucher& voucher);
-    void startGuestSession(const Voucher& voucher);
+    void startGuestSession(const QString& username, const Voucher& voucher);
     void startMemberSession(const User& user);
     void startAdminstratorSession();
     void resetSession();
