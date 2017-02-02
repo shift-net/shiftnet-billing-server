@@ -13,6 +13,7 @@
 #include <QVariant>
 #include <QCryptographicHash>
 #include <QSqlRecord>
+#include <QDebug>
 
 #define ACTIVITY_USER_TOPUP "topup"
 #define ACTIVITY_USER_SESSION_START "session-start"
@@ -77,8 +78,8 @@ void Server::onWebSocketDisconnected()
         Client* client = clientsByIds.value(socket->property("client-id").toInt());
         const User user = client->user();
 
-        Database::transaction();
         if (user.isMember() || user.isGuest()) {
+            Database::transaction();
             if (user.isMember())
                 Database::resetMemberClientState(user.id());
             else
@@ -86,8 +87,8 @@ void Server::onWebSocketDisconnected()
 
             Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_STOP,
                                       QString("Koneksi terputus, sesi telah dihentikan."));
+            Database::commit();
         }
-        Database::commit();
 
         client->resetConnection();
         sendToClientMonitors("client-disconnected", client->toMap());
@@ -160,16 +161,15 @@ void Server::onWebSocketTextMessageReceived(const QString& jsonString)
 }
 
 // Client Callbacks
-#include <QDebug>
+
 void Server::onClientSessionTimeout(const User& user)
 {
     Client* client = qobject_cast<Client*>(sender());
 
-    Database::transaction();
     if (user.isMember() || user.isGuest()) {
+        Database::transaction();
         if (user.isMember()) {
-            qDebug() << user.id();
-            qDebug() << Database::resetMemberClientState(user.id());
+            Database::resetMemberClientState(user.id());
             Database::updateMemberDuration(user.id(), 0);
         }
         else {
@@ -177,8 +177,8 @@ void Server::onClientSessionTimeout(const User& user)
         }
         Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_STOP,
                                   QString("Pemakaian dihentikan karena sisa waktu telah habis."));
+        Database::commit();
     }
-    Database::commit();
 
     sendTo(client->connection(), "session-timeout", QVariant());
     sendToClientMonitors("client-session-timeout", client->toMap());
@@ -380,7 +380,7 @@ void Server::processClientSessionStop(Client* client)
     }
     else if (user.isMember()) {
         Database::resetMemberClientState(user.id());
-        activityInfo = QString("Sisa Waktu: %1.").arg(user.duration());
+        activityInfo = QString("Sisa Waktu: %1.").arg(Voucher("", user.duration()).durationString());
     }
     Database::logUserActivity(client->id(), user, ACTIVITY_USER_SESSION_STOP, "Sesi pemakaian dihentikan. " + activityInfo);
     Database::commit();
