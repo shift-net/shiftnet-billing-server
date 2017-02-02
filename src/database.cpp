@@ -235,10 +235,10 @@ bool Database::logUserActivity(int clientId, const User& user, const QString& ac
 {
     QSqlQuery q(QSqlDatabase::database());
     q.prepare("insert into user_activities"
-              "( date_time, client_id, user_id, user_group, user_username, activity_type, activity_detail)"
+              "( datetime, client_id, user_id, user_group, user_username, activity_type, activity_detail)"
               "values"
-              "(:date_time,:client_id,:user_id,:user_group,:user_username,:activity_type,:activity_detail)");
-    q.bindValue(":date_time", QDateTime::currentDateTime());
+              "(:datetime,:client_id,:user_id,:user_group,:user_username,:activity_type,:activity_detail)");
+    q.bindValue(":datetime", QDateTime::currentDateTime());
     q.bindValue(":client_id", clientId);
     q.bindValue(":user_id", user.id());
     q.bindValue(":user_group", user.group());
