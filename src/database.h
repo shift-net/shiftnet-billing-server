@@ -1,6 +1,8 @@
 #ifndef DATABASE_H
 #define DATABASE_H
 
+#include <QtGlobal>
+
 class QSettings;
 class QString;
 class QSqlRecord;
@@ -21,7 +23,7 @@ public:
 
     static bool topupVoucher(int clientId, const User& user, const Voucher& voucher);
 
-    static bool useVoucher(const QString& code, int clientId);
+    static bool useVoucher(const QString& code, int clientId, const QString& username);
     static bool deleteVoucher(const QString& code);
     static bool updateMemberDuration(int memberId, int duration);
     static bool updateVoucherDuration(const QString& code, int duration);
@@ -34,8 +36,9 @@ public:
 
     static QSqlRecord findVoucher(const QString& code);
     static QSqlRecord findMember(const QString& username);
+    static QList<QSqlRecord> clients();
 
-    static bool logUserActivity(int clientId, const User& user, const QString& activity, const QString &text);
+    static bool logUserActivity(int clientId, const User& user, const QString& activity, const QString &text, quint64 voucherId = 0);
 
 private:
     Database();

@@ -27,6 +27,23 @@ void Database::setup(QSettings &settings)
     settings.endGroup();
 }
 
+QList<QSqlRecord> Database::clients()
+{
+    QList<QSqlRecord> clients;
+
+    QSqlQuery q(QSqlDatabase::database());
+    q.prepare("select * from shiftnet_clients order by id asc");
+    if (!q.exec()) {
+        LOG_DB_ERROR(q);
+        return clients;
+    }
+
+    while (q.next())
+        clients << q.record();
+
+    return clients;
+}
+
 bool Database::init()
 {
     QSqlDatabase db = QSqlDatabase::database();
@@ -37,24 +54,59 @@ bool Database::init()
         return false;
     }
 
+    QList<quint64> expiredVoucherIds;
+    q.prepare("select"
+              " t.id, t.expirationDateTime"
+              " from shiftnet_active_vouchers a"
+              " inner join shiftnet_voucher_transactions t"
+              "   on t.id = a.voucherId");
+
+    if (!q.exec()) {
+        LOG_DB_ERROR(db);
+        return false;
+    }
+
+    QDateTime now = QDateTime::currentDateTime();
+    while (q.next()) {
+        QDateTime dateTime = q.value("expirationDateTime").toDateTime();
+
+        if (dateTime < now) {
+            expiredVoucherIds << q.value("id").value<quint64>();
+        }
+    }
+
     if (!db.transaction()) {
         LOG_DB_ERROR(db);
         return false;
     }
 
-    if (!q.exec("update members set client_id=0 where 1")) {
+    // reset activeClientId
+    if (!q.exec("update shiftnet_members set activeClientId=null where 1")) {
         LOG_DB_ERROR(q);
+        db.rollback();
         return false;
     }
 
-    q.prepare("delete from vouchers where duration<=0 or expiration_datetime<=?");
-    q.bindValue(0, QDateTime::currentDateTime());
+    // delete empty duration voucher
+    q.prepare("delete from shiftnet_active_vouchers where remainingDuration<=0");
     if (!q.exec()) {
         LOG_DB_ERROR(q);
+        db.rollback();
         return false;
     }
 
-    if (!q.exec("update vouchers set client_id=0 where 1")) {
+    // delete expired vouchers
+    for (quint64 voucherId: expiredVoucherIds) {
+        q.prepare("delete from shiftnet_active_vouchers where voucherId=?");
+        q.bindValue(0, voucherId);
+        if (!q.exec()) {
+            LOG_DB_ERROR(q);
+            db.rollback();
+            return false;
+        }
+    }
+
+    if (!q.exec("update shiftnet_active_vouchers set activeClientId=null where 1")) {
         LOG_DB_ERROR(q);
         return false;
     }
@@ -70,7 +122,7 @@ bool Database::init()
 bool Database::deleteVoucher(const QString &code)
 {
     QSqlQuery q(QSqlDatabase::database());
-    q.prepare("delete from vouchers where code=?");
+    q.prepare("delete from shiftnet_active_vouchers where code=?");
     q.bindValue(0, code);
     if (!q.exec()) {
         LOG_DB_ERROR(q);
@@ -84,7 +136,7 @@ bool Database::updateMemberDuration(int id, int duration)
 {
     QSqlQuery q(QSqlDatabase::database());
 
-    q.prepare("update members set duration=? where id=?");
+    q.prepare("update shiftnet_members set remainingDuration=? where id=?");
     q.bindValue(0, duration);
     q.bindValue(1, id);
 
@@ -100,7 +152,7 @@ bool Database::updateVoucherDuration(const QString& code, int duration)
 {
     QSqlQuery q(QSqlDatabase::database());
 
-    q.prepare("update vouchers set duration=? where code=?");
+    q.prepare("update shiftnet_active_vouchers set remainingDuration=? where code=?");
     q.bindValue(0, duration);
     q.bindValue(1, code);
 
@@ -115,7 +167,7 @@ bool Database::updateVoucherDuration(const QString& code, int duration)
 bool Database::resetVoucherClientState(int id)
 {
     QSqlQuery q(QSqlDatabase::database());
-    q.prepare("update vouchers set client_id=0 where client_id=?");
+    q.prepare("update shiftnet_active_vouchers set activeClientId=null where activeClientId=?");
     q.bindValue(0, id);
     if (!q.exec()) {
         LOG_DB_ERROR(q);
@@ -128,7 +180,7 @@ bool Database::resetVoucherClientState(int id)
 bool Database::resetMemberClientState(int memberId)
 {
     QSqlQuery q(QSqlDatabase::database());
-    q.prepare("update members set client_id=0 where id=?");
+    q.prepare("update shiftnet_members set activeClientId=null where id=?");
     q.bindValue(0, memberId);
     if (!q.exec()) {
         LOG_DB_ERROR(q);
@@ -141,7 +193,10 @@ bool Database::resetMemberClientState(int memberId)
 QSqlRecord Database::findVoucher(const QString &code)
 {
     QSqlQuery q(QSqlDatabase::database());
-    q.prepare("select * from vouchers where code=?");
+    q.prepare("select a.code, a.lastActiveUsername, a.remainingDuration, a.activeClientId, t.id, t.expirationDateTime"
+              " from shiftnet_active_vouchers a"
+              " inner join shiftnet_voucher_transactions t on t.id = a.voucherId"
+              " where a.code=?");
     q.bindValue(0, code);
     if (!q.exec()) {
         LOG_DB_ERROR(q);
@@ -155,12 +210,13 @@ QSqlRecord Database::findVoucher(const QString &code)
     return q.record();
 }
 
-bool Database::useVoucher(const QString &code, int clientId)
+bool Database::useVoucher(const QString &code, int clientId, const QString& username)
 {
     QSqlQuery q(QSqlDatabase::database());
-    q.prepare("update vouchers set client_id=?, is_used=1 where code=?");
+    q.prepare("update shiftnet_active_vouchers set activeClientId=?, lastActiveUsername=? where code=?");
     q.bindValue(0, clientId);
-    q.bindValue(1, code);
+    q.bindValue(1, username);
+    q.bindValue(2, code);
     if (!q.exec()) {
         LOG_DB_ERROR(q);
         return false;
@@ -195,7 +251,8 @@ bool Database::topupMemberVoucher(int userId, int memberDuration, const QString 
 QSqlRecord Database::findMember(const QString &username)
 {
     QSqlQuery q(QSqlDatabase::database());
-    q.prepare("select * from members where username=?");
+    q.prepare("select id, username, password, active, remainingDuration, activeClientId"
+              " from shiftnet_members where username=?");
     q.bindValue(0, username);
     if (!q.exec()) {
         LOG_DB_ERROR(q);
@@ -210,7 +267,7 @@ QSqlRecord Database::findMember(const QString &username)
 bool Database::setMemberClientId(int memberId, int clientId)
 {
     QSqlQuery q(QSqlDatabase::database());
-    q.prepare("update members set client_id=? where id=?");
+    q.prepare("update shiftnet_members set activeClientId=? where id=?");
     q.bindValue(0, clientId);
     q.bindValue(1, memberId);
     if (!q.exec()) {
@@ -226,25 +283,27 @@ bool Database::topupVoucher(int clientId, const User& user, const Voucher& vouch
         return topupMemberVoucher(user.id(), user.duration(), voucher.code(), voucher.duration());
 
     if (user.isGuest())
-        return useVoucher(voucher.code(), clientId);
+        return useVoucher(voucher.code(), clientId, user.username());
 
     return false;
 }
 
-bool Database::logUserActivity(int clientId, const User& user, const QString& activity, const QString &text)
+bool Database::logUserActivity(int clientId, const User& user, const QString& activity, const QString &text, quint64 voucherId)
 {
     QSqlQuery q(QSqlDatabase::database());
-    q.prepare("insert into user_activities"
-              "( datetime, client_id, user_id, user_group, user_username, activity_type, activity_detail)"
-              "values"
-              "(:datetime,:client_id,:user_id,:user_group,:user_username,:activity_type,:activity_detail)");
-    q.bindValue(":datetime", QDateTime::currentDateTime());
-    q.bindValue(":client_id", clientId);
-    q.bindValue(":user_id", user.id());
-    q.bindValue(":user_group", user.group());
-    q.bindValue(":user_username", user.username());
-    q.bindValue(":activity_type", activity);
-    q.bindValue(":activity_detail", text);
+    q.prepare("insert into shiftnet_activities"
+              "( dateTime, groupId, clientId, memberId, voucherId, username, type, detail)"
+              " values "
+              "(:dateTime,:groupId,:clientId,:memberId,:voucherId,:username,:type,:detail)");
+    q.bindValue(":dateTime", QDateTime::currentDateTime());
+    q.bindValue(":clientId", clientId);
+    q.bindValue(":memberId", user.isMember() ? user.id() : QVariant());
+    q.bindValue(":voucherId", voucherId ? voucherId : QVariant());
+    q.bindValue(":groupId", user.group());
+    q.bindValue(":username", user.username());
+    q.bindValue(":type", activity);
+    q.bindValue(":detail", text);
+
     if (!q.exec()) {
         LOG_DB_ERROR(q);
         return false;

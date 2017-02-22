@@ -34,6 +34,9 @@ public:
     inline void setHostAddress(const QString& address) { _hostAddress = address; }
     inline QString hostAddress() const { return _hostAddress; }
 
+    inline void setMacAddress(const QString& address) { _macAddress = address; }
+    inline QString macAddress() const { return _macAddress; }
+
     inline State state() const { return _state; }
     inline User user() const { return _user; }
     inline Voucher activeVoucher() const { return _activeVoucher; }
